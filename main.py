@@ -1,235 +1,273 @@
-"""Player based on a trained neural network"""
-# pylint: disable=wrong-import-order
+"""
+neuron poker
+
+Usage:
+  main.py selfplay random [options]
+  main.py selfplay keypress [options]
+  main.py selfplay consider_equity [options]
+  main.py selfplay equity_improvement --improvement_rounds=<> [options]
+  main.py selfplay dqn_train [options]
+  main.py selfplay dqn_play [options]
+  main.py learn_table_scraping [options]
+
+options:
+  -h --help                 Show this screen.
+  -r --render               render screen
+  -c --use_cpp_montecarlo   use cpp implementation of equity calculator. Requires cpp compiler but is 500x faster
+  -f --funds_plot           Plot funds at end of episode
+  --log                     log file
+  --name=<>                 Name of the saved model
+  --screenloglevel=<>       log level on screen
+  --episodes=<>             number of episodes to play
+  --stack=<>                starting stack for each player [default: 500].
+
+"""
+
 import logging
-import time
 
+import gym
 import numpy as np
+import pandas as pd
+from docopt import docopt
 
-from gym_env.env import Action
-
-import tensorflow as tf
-import json
-
-from tensorflow.keras.models import Sequential, model_from_json
-from keras.callbacks import TensorBoard
-from tensorflow.keras.layers import Dense, Dropout
-from tensorflow.keras.optimizers import Adam
-
-from rl.policy import BoltzmannQPolicy
-from rl.memory import SequentialMemory
-from rl.agents import DQNAgent
-from rl.core import Processor
-autoplay = True  # play automatically if played against keras-rl
-
-window_length = 1
-nb_max_start_steps = 1  # random action
-train_interval = 100  # train every 100 steps
-nb_steps_warmup = 50  # before training starts, should be higher than start steps
-nb_steps = 10000
-memory_limit = int(nb_steps / 2)
-batch_size = 500  # items sampled from memory to train
-enable_double_dqn = True
-enable_dueling_network = False
-
-log = logging.getLogger(__name__)
+from gym_env.env import PlayerShell
+from tools.helper import get_config
+from tools.helper import init_logger
 
 
-class Player:
-    """Mandatory class with the player methods"""
+# pylint: disable=import-outside-toplevel
 
-    def __init__(self, name='DQN', load_model=None, env=None):
-        """Initiaization of an agent"""
-        self.equity_alive = 0
-        self.actions = []
-        self.last_action_in_stage = ''
-        self.temp_stack = []
-        self.name = name
-        self.autoplay = True
+def command_line_parser():
+    """Entry function"""
+    args = docopt(__doc__)
+    if args['--log']:
+        logfile = args['--log']
+    else:
+        print("Using default log file")
+        logfile = 'default'
+    model_name = args['--name'] if args['--name'] else 'dqn1'
+    screenloglevel = logging.INFO if not args['--screenloglevel'] else \
+        getattr(logging, args['--screenloglevel'].upper())
+    _ = get_config()
+    init_logger(screenlevel=screenloglevel, filename=logfile)
+    print(f"Screenloglevel: {screenloglevel}")
+    log = logging.getLogger("")
+    log.info("Initializing program")
 
-        self.dqn = None
-        self.model = None
-        self.env = env
+    if args['selfplay']:
+        num_episodes = 1 if not args['--episodes'] else int(args['--episodes'])
+        runner = SelfPlay(render=args['--render'], num_episodes=num_episodes,
+                          use_cpp_montecarlo=args['--use_cpp_montecarlo'],
+                          funds_plot=args['--funds_plot'],
+                          stack=int(args['--stack']))
 
-        if load_model:
-            self.load(load_model)
+        if args['random']:
+            runner.random_agents()
 
-    def initiate_agent(self, env):
-        """initiate a deep Q agent"""
-        tf.compat.v1.disable_eager_execution()
+        elif args['keypress']:
+            runner.key_press_agents()
 
-        self.env = env
+        elif args['consider_equity']:
+            runner.equity_vs_random()
 
-        nb_actions = self.env.action_space.n
+        elif args['equity_improvement']:
+            improvement_rounds = int(args['--improvement_rounds'])
+            runner.equity_self_improvement(improvement_rounds)
 
-        self.model = Sequential()
-        self.model.add(Dense(128, activation='relu',
-                             input_shape=env.observation_space))
-        self.model.add(Dropout(0.2))
-        self.model.add(Dense(256, activation='relu'))
-        self.model.add(Dropout(0.2))
-        self.model.add(Dense(512, activation='relu'))
-        self.model.add(Dropout(0.2))
-        self.model.add(Dense(nb_actions, activation='linear'))
+        elif args['dqn_train']:
+            runner.dqn_train_keras_rl(model_name)
 
-        # Finally, we configure and compile our agent. You can use every built-in Keras optimizer and
-        # even the metrics!
-        memory = SequentialMemory(
-            limit=memory_limit, window_length=window_length)
-        policy = TrumpPolicy()
+        elif args['dqn_play']:
+            runner.dqn_play_keras_rl(model_name)
 
-        nb_actions = env.action_space.n
-
-        self.dqn = DQNAgent(model=self.model, nb_actions=nb_actions, memory=memory, nb_steps_warmup=nb_steps_warmup,
-                            target_model_update=1e-2, policy=policy,
-                            processor=CustomProcessor(),
-                            batch_size=batch_size, train_interval=train_interval, enable_double_dqn=enable_double_dqn,
-                            enable_dueling_network=enable_dueling_network)
-        self.dqn.compile(Adam(lr=1e-3), metrics=['mae'])
-
-    def start_step_policy(self, observation):
-        """Custom policy for random decisions for warm up."""
-        log.info("Random action")
-        _ = observation
-        action = self.env.action_space.sample()
-        return action
-
-    def train(self, env_name):
-        """Train a model"""
-        # initiate training loop
-        timestr = time.strftime("%Y%m%d-%H%M%S") + "_" + str(env_name)
-        tensorboard = TensorBoard(log_dir='./Graph/{}'.format(timestr), histogram_freq=0, write_graph=True,
-                                  write_images=False)
-        # tensorboard = TensorBoard(log_dir="logs")
-        tensorboard = TensorBoard(log_dir='./logs', histogram_freq=0, batch_size=32, write_graph=True, write_grads=False,
-                                  write_images=False, embeddings_freq=0, embeddings_layer_names=None, embeddings_metadata=None)
-
-        self.dqn.fit(self.env, nb_max_start_steps=nb_max_start_steps, nb_steps=nb_steps, visualize=False, verbose=2,
-                     start_step_policy=self.start_step_policy)
-
-        # Save the architecture
-        dqn_json = self.model.to_json()
-        with open("dqn_{}_json.json".format(env_name), "w") as json_file:
-            json.dump(dqn_json, json_file)
-
-        # After training is done, we save the final weights.
-        self.dqn.save_weights(
-            'dqn_{}_weights.h5'.format(env_name), overwrite=True)
-
-        # Finally, evaluate our algorithm for 5 episodes.
-        self.dqn.test(self.env, nb_episodes=5, visualize=False)
-
-    def load(self, env_name):
-        """Load a model"""
-
-        # Load the architecture
-        with open('dqn_{}_json.json'.format(env_name), 'r') as architecture_json:
-            dqn_json = json.load(architecture_json)
-
-        self.model = model_from_json(dqn_json)
-        self.model.load_weights('dqn_{}_weights.h5'.format(env_name))
-
-    def play(self, nb_episodes=5, render=False):
-        """Let the agent play"""
-        memory = SequentialMemory(
-            limit=memory_limit, window_length=window_length)
-        policy = TrumpPolicy()
-
-        class CustomProcessor(Processor):  # pylint: disable=redefined-outer-name
-            """The agent and the environment"""
-
-            def process_state_batch(self, batch):
-                """
-                Given a state batch, I want to remove the second dimension, because it's
-                useless and prevents me from feeding the tensor into my CNN
-                """
-                return np.squeeze(batch, axis=1)
-
-            def process_info(self, info):
-                processed_info = info['player_data']
-                if 'stack' in processed_info:
-                    processed_info = {'x': 1}
-                return processed_info
-
-        nb_actions = self.env.action_space.n
-
-        self.dqn = DQNAgent(model=self.model, nb_actions=nb_actions, memory=memory, nb_steps_warmup=nb_steps_warmup,
-                            target_model_update=1e-2, policy=policy,
-                            processor=CustomProcessor(),
-                            batch_size=batch_size, train_interval=train_interval, enable_double_dqn=enable_double_dqn)
-        self.dqn.compile(
-            Adam(lr=1e-3), metrics=['mae'])  # pylint: disable=no-member
-
-        self.dqn.test(self.env, nb_episodes=nb_episodes, visualize=render)
-
-    def action(self, action_space, observation, info):  # pylint: disable=no-self-use
-        """Mandatory method that calculates the move based on the observation array and the action space."""
-        _ = observation  # not using the observation for random decision
-        _ = info
-
-        this_player_action_space = {Action.FOLD, Action.CHECK, Action.CALL, Action.RAISE_POT, Action.RAISE_HALF_POT,
-                                    Action.RAISE_2POT}
-        _ = this_player_action_space.intersection(set(action_space))
-
-        action = None
-        return action
+    else:
+        raise RuntimeError("Argument not yet implemented")
 
 
-class TrumpPolicy(BoltzmannQPolicy):
-    """Custom policy when making decision based on neural network."""
+class SelfPlay:
+    """Orchestration of playing against itself"""
 
-    def select_action(self, q_values):
-        """Return the selected action
+    def __init__(self, render, num_episodes, use_cpp_montecarlo, funds_plot, stack=500):
+        """Initialize"""
+        self.winner_in_episodes = []
+        self.use_cpp_montecarlo = use_cpp_montecarlo
+        self.funds_plot = funds_plot
+        self.render = render
+        self.env = None
+        self.num_episodes = num_episodes
+        self.stack = stack
+        self.log = logging.getLogger(__name__)
 
-        # Arguments
-            q_values (np.ndarray): List of the estimations of Q for each action
+    def random_agents(self):
+        """Create an environment with 6 random players"""
+        from agents.agent_random import Player as RandomPlayer
+        env_name = 'neuron_poker-v0'
+        num_of_plrs = 2
+        self.env = gym.make(
+            env_name, initial_stacks=self.stack, render=self.render)
+        for _ in range(num_of_plrs):
+            player = RandomPlayer()
+            self.env.add_player(player)
 
-        # Returns
-            Selection action
-        """
-        assert q_values.ndim == 1
-        q_values = q_values.astype('float64')
-        nb_actions = q_values.shape[0]
+        self.env.reset()
 
-        exp_values = np.exp(np.clip(q_values / self.tau,
-                                    self.clip[0], self.clip[1]))
-        probs = exp_values / np.sum(exp_values)
-        action = np.random.choice(range(nb_actions), p=probs)
-        log.info(
-            f"Chosen action by keras-rl {action} - probabilities: {probs}")
-        return action
+    def key_press_agents(self):
+        """Create an environment with 6 key press agents"""
+        from agents.agent_keypress import Player as KeyPressAgent
+        env_name = 'neuron_poker-v0'
+        num_of_plrs = 2
+        self.env = gym.make(
+            env_name, initial_stacks=self.stack, render=self.render)
+        for _ in range(num_of_plrs):
+            player = KeyPressAgent()
+            self.env.add_player(player)
+
+        self.env.reset()
+
+    def equity_vs_random(self):
+        """Create 6 players, 4 of them equity based, 2 of them random"""
+        from agents.agent_consider_equity import Player as EquityPlayer
+        from agents.agent_random import Player as RandomPlayer
+        env_name = 'neuron_poker-v0'
+        self.env = gym.make(
+            env_name, initial_stacks=self.stack, render=self.render)
+        self.env.add_player(EquityPlayer(
+            name='equity/50/50', min_call_equity=.5, min_bet_equity=-.5))
+        self.env.add_player(EquityPlayer(
+            name='equity/50/80', min_call_equity=.8, min_bet_equity=-.8))
+        self.env.add_player(EquityPlayer(
+            name='equity/70/70', min_call_equity=.7, min_bet_equity=-.7))
+        self.env.add_player(EquityPlayer(
+            name='equity/20/30', min_call_equity=.2, min_bet_equity=-.3))
+        self.env.add_player(RandomPlayer())
+        self.env.add_player(RandomPlayer())
+
+        for _ in range(self.num_episodes):
+            self.env.reset()
+            self.winner_in_episodes.append(self.env.winner_ix)
+
+        league_table = pd.Series(self.winner_in_episodes).value_counts()
+        best_player = league_table.index[0]
+
+        print("League Table")
+        print("============")
+        print(league_table)
+        print(f"Best Player: {best_player}")
+
+    def equity_self_improvement(self, improvement_rounds):
+        """Create 6 players, 4 of them equity based, 2 of them random"""
+        from agents.agent_consider_equity import Player as EquityPlayer
+        calling = [.1, .2, .3, .4, .5, .6]
+        betting = [.2, .3, .4, .5, .6, .7]
+
+        for improvement_round in range(improvement_rounds):
+            env_name = 'neuron_poker-v0'
+            self.env = gym.make(
+                env_name, initial_stacks=self.stack, render=self.render)
+            for i in range(6):
+                self.env.add_player(EquityPlayer(name=f'Equity/{calling[i]}/{betting[i]}',
+                                                 min_call_equity=calling[i],
+                                                 min_bet_equity=betting[i]))
+
+            for _ in range(self.num_episodes):
+                self.env.reset()
+                self.winner_in_episodes.append(self.env.winner_ix)
+
+            league_table = pd.Series(self.winner_in_episodes).value_counts()
+            best_player = int(league_table.index[0])
+            print(league_table)
+            print(f"Best Player: {best_player}")
+
+            # self improve:
+            self.log.info(f"Self improvment round {improvement_round}")
+            for i in range(6):
+                calling[i] = np.mean([calling[i], calling[best_player]])
+                self.log.info(f"New calling for player {i} is {calling[i]}")
+                betting[i] = np.mean([betting[i], betting[best_player]])
+                self.log.info(f"New betting for player {i} is {betting[i]}")
+
+    def dqn_train_keras_rl(self, model_name):
+        """Implementation of kreras-rl deep q learing."""
+        from agents.agent_consider_equity import Player as EquityPlayer
+        from agents.agent_keras_rl_dqn import Player as DQNPlayer
+        from agents.agent_random import Player as RandomPlayer
+        env_name = 'neuron_poker-v0'
+        env = gym.make(env_name, initial_stacks=self.stack, funds_plot=self.funds_plot, render=self.render,
+                       use_cpp_montecarlo=self.use_cpp_montecarlo)
+
+        np.random.seed(123)
+        env.seed(123)
+        env.add_player(EquityPlayer(name='equity/50/70',
+                                    min_call_equity=.5, min_bet_equity=.7))
+        env.add_player(EquityPlayer(name='equity/20/30',
+                                    min_call_equity=.2, min_bet_equity=.3))
+        env.add_player(RandomPlayer())
+        env.add_player(RandomPlayer())
+        env.add_player(RandomPlayer())
+        # shell is used for callback to keras rl
+        env.add_player(PlayerShell(name='keras-rl', stack_size=self.stack))
+
+        env.reset()
+
+        dqn = DQNPlayer()
+        dqn.initiate_agent(env)
+        dqn.train(env_name=model_name)
+
+    def dqn_play_keras_rl(self, model_name):
+        """Create 6 players, one of them a trained DQN"""
+        from agents.agent_consider_equity import Player as EquityPlayer
+        from agents.agent_keras_rl_dqn import Player as DQNPlayer
+        from agents.agent_random import Player as RandomPlayer
+        env_name = 'neuron_poker-v0'
+        self.env = gym.make(
+            env_name, initial_stacks=self.stack, render=self.render)
+        self.env.add_player(EquityPlayer(
+            name='equity/50/50', min_call_equity=.5, min_bet_equity=.5))
+        self.env.add_player(EquityPlayer(
+            name='equity/50/80', min_call_equity=.8, min_bet_equity=.8))
+        self.env.add_player(EquityPlayer(
+            name='equity/70/70', min_call_equity=.7, min_bet_equity=.7))
+        self.env.add_player(EquityPlayer(
+            name='equity/20/30', min_call_equity=.2, min_bet_equity=.3))
+        self.env.add_player(RandomPlayer())
+        self.env.add_player(PlayerShell(
+            name='keras-rl', stack_size=self.stack))
+
+        self.env.reset()
+
+        dqn = DQNPlayer(load_model=model_name, env=self.env)
+        dqn.play(nb_episodes=self.num_episodes, render=self.render)
+
+    def dqn_train_custom_q1(self):
+        """Create 6 players, 4 of them equity based, 2 of them random"""
+        from agents.agent_consider_equity import Player as EquityPlayer
+        from agents.agent_custom_q1 import Player as Custom_Q1
+        from agents.agent_random import Player as RandomPlayer
+        env_name = 'neuron_poker-v0'
+        self.env = gym.make(
+            env_name, initial_stacks=self.stack, render=self.render)
+        # self.env.add_player(EquityPlayer(name='equity/50/50', min_call_equity=.5, min_bet_equity=-.5))
+        # self.env.add_player(EquityPlayer(name='equity/50/80', min_call_equity=.8, min_bet_equity=-.8))
+        # self.env.add_player(EquityPlayer(name='equity/70/70', min_call_equity=.7, min_bet_equity=-.7))
+        self.env.add_player(EquityPlayer(
+            name='equity/20/30', min_call_equity=.2, min_bet_equity=-.3))
+        # self.env.add_player(RandomPlayer())
+        self.env.add_player(RandomPlayer())
+        self.env.add_player(RandomPlayer())
+        self.env.add_player(Custom_Q1(name='Deep_Q1'))
+
+        for _ in range(self.num_episodes):
+            self.env.reset()
+            self.winner_in_episodes.append(self.env.winner_ix)
+
+        league_table = pd.Series(self.winner_in_episodes).value_counts()
+        best_player = league_table.index[0]
+
+        print("League Table")
+        print("============")
+        print(league_table)
+        print(f"Best Player: {best_player}")
 
 
-class CustomProcessor(Processor):
-    """The agent and the environment"""
-
-    def __init__(self):
-        """initizlie properties"""
-        self.legal_moves_limit = None
-
-    def process_state_batch(self, batch):
-        """Remove second dimension to make it possible to pass it into cnn"""
-        return np.squeeze(batch, axis=1)
-
-    def process_info(self, info):
-        if 'legal_moves' in info.keys():
-            self.legal_moves_limit = info['legal_moves']
-        else:
-            self.legal_moves_limit = None
-        return {'x': 1}  # on arrays allowed it seems
-
-    def process_action(self, action):
-        """Find nearest legal action"""
-        if 'legal_moves_limit' in self.__dict__ and self.legal_moves_limit is not None:
-            self.legal_moves_limit = [
-                move.value for move in self.legal_moves_limit]
-            if action not in self.legal_moves_limit:
-                for i in range(5):
-                    action += i
-                    if action in self.legal_moves_limit:
-                        break
-                    action -= i * 2
-                    if action in self.legal_moves_limit:
-                        break
-                    action += i
-
-        return action
+if __name__ == '__main__':
+    command_line_parser()

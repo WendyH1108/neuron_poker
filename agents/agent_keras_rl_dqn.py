@@ -11,7 +11,7 @@ import tensorflow as tf
 import json
 
 from tensorflow.keras.models import Sequential, model_from_json
-from tensorflow.keras.callbacks import TensorBoard
+from keras.callbacks import TensorBoard
 from tensorflow.keras.layers import Dense, Dropout
 from tensorflow.keras.optimizers import Adam
 
@@ -19,17 +19,17 @@ from rl.policy import BoltzmannQPolicy
 from rl.memory import SequentialMemory
 from rl.agents import DQNAgent
 from rl.core import Processor
-
 autoplay = True  # play automatically if played against keras-rl
 
 window_length = 1
 nb_max_start_steps = 1  # random action
 train_interval = 100  # train every 100 steps
 nb_steps_warmup = 50  # before training starts, should be higher than start steps
-nb_steps = 100000
+nb_steps = 10000
 memory_limit = int(nb_steps / 2)
 batch_size = 500  # items sampled from memory to train
-enable_double_dqn = False
+enable_double_dqn = True
+enable_dueling_network = False
 
 log = logging.getLogger(__name__)
 
@@ -62,9 +62,10 @@ class Player:
         nb_actions = self.env.action_space.n
 
         self.model = Sequential()
-        self.model.add(Dense(512, activation='relu', input_shape=env.observation_space))
+        self.model.add(Dense(128, activation='relu',
+                             input_shape=env.observation_space))
         self.model.add(Dropout(0.2))
-        self.model.add(Dense(512, activation='relu'))
+        self.model.add(Dense(256, activation='relu'))
         self.model.add(Dropout(0.2))
         self.model.add(Dense(512, activation='relu'))
         self.model.add(Dropout(0.2))
@@ -72,7 +73,8 @@ class Player:
 
         # Finally, we configure and compile our agent. You can use every built-in Keras optimizer and
         # even the metrics!
-        memory = SequentialMemory(limit=memory_limit, window_length=window_length)
+        memory = SequentialMemory(
+            limit=memory_limit, window_length=window_length)
         policy = TrumpPolicy()
 
         nb_actions = env.action_space.n
@@ -80,7 +82,8 @@ class Player:
         self.dqn = DQNAgent(model=self.model, nb_actions=nb_actions, memory=memory, nb_steps_warmup=nb_steps_warmup,
                             target_model_update=1e-2, policy=policy,
                             processor=CustomProcessor(),
-                            batch_size=batch_size, train_interval=train_interval, enable_double_dqn=enable_double_dqn)
+                            batch_size=batch_size, train_interval=train_interval, enable_double_dqn=enable_double_dqn,
+                            enable_dueling_network=enable_dueling_network)
         self.dqn.compile(Adam(lr=1e-3), metrics=['mae'])
 
     def start_step_policy(self, observation):
@@ -96,9 +99,12 @@ class Player:
         timestr = time.strftime("%Y%m%d-%H%M%S") + "_" + str(env_name)
         tensorboard = TensorBoard(log_dir='./Graph/{}'.format(timestr), histogram_freq=0, write_graph=True,
                                   write_images=False)
+        # tensorboard = TensorBoard(log_dir="logs")
+        tensorboard = TensorBoard(log_dir='./logs', histogram_freq=0, batch_size=32, write_graph=True, write_grads=False,
+                                  write_images=False, embeddings_freq=0, embeddings_layer_names=None, embeddings_metadata=None)
 
         self.dqn.fit(self.env, nb_max_start_steps=nb_max_start_steps, nb_steps=nb_steps, visualize=False, verbose=2,
-                     start_step_policy=self.start_step_policy, callbacks=[tensorboard])
+                     start_step_policy=self.start_step_policy)
 
         # Save the architecture
         dqn_json = self.model.to_json()
@@ -106,7 +112,8 @@ class Player:
             json.dump(dqn_json, json_file)
 
         # After training is done, we save the final weights.
-        self.dqn.save_weights('dqn_{}_weights.h5'.format(env_name), overwrite=True)
+        self.dqn.save_weights(
+            'dqn_{}_weights.h5'.format(env_name), overwrite=True)
 
         # Finally, evaluate our algorithm for 5 episodes.
         self.dqn.test(self.env, nb_episodes=5, visualize=False)
@@ -123,7 +130,8 @@ class Player:
 
     def play(self, nb_episodes=5, render=False):
         """Let the agent play"""
-        memory = SequentialMemory(limit=memory_limit, window_length=window_length)
+        memory = SequentialMemory(
+            limit=memory_limit, window_length=window_length)
         policy = TrumpPolicy()
 
         class CustomProcessor(Processor):  # pylint: disable=redefined-outer-name
@@ -148,7 +156,8 @@ class Player:
                             target_model_update=1e-2, policy=policy,
                             processor=CustomProcessor(),
                             batch_size=batch_size, train_interval=train_interval, enable_double_dqn=enable_double_dqn)
-        self.dqn.compile(Adam(lr=1e-3), metrics=['mae'])  # pylint: disable=no-member
+        self.dqn.compile(
+            Adam(lr=1e-3), metrics=['mae'])  # pylint: disable=no-member
 
         self.dqn.test(self.env, nb_episodes=nb_episodes, visualize=render)
 
@@ -181,10 +190,12 @@ class TrumpPolicy(BoltzmannQPolicy):
         q_values = q_values.astype('float64')
         nb_actions = q_values.shape[0]
 
-        exp_values = np.exp(np.clip(q_values / self.tau, self.clip[0], self.clip[1]))
+        exp_values = np.exp(np.clip(q_values / self.tau,
+                                    self.clip[0], self.clip[1]))
         probs = exp_values / np.sum(exp_values)
         action = np.random.choice(range(nb_actions), p=probs)
-        log.info(f"Chosen action by keras-rl {action} - probabilities: {probs}")
+        log.info(
+            f"Chosen action by keras-rl {action} - probabilities: {probs}")
         return action
 
 
@@ -209,7 +220,8 @@ class CustomProcessor(Processor):
     def process_action(self, action):
         """Find nearest legal action"""
         if 'legal_moves_limit' in self.__dict__ and self.legal_moves_limit is not None:
-            self.legal_moves_limit = [move.value for move in self.legal_moves_limit]
+            self.legal_moves_limit = [
+                move.value for move in self.legal_moves_limit]
             if action not in self.legal_moves_limit:
                 for i in range(5):
                     action += i
