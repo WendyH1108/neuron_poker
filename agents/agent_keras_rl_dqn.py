@@ -15,7 +15,7 @@ from keras.callbacks import TensorBoard
 from tensorflow.keras.layers import Dense, Dropout
 from tensorflow.keras.optimizers import Adam
 
-from rl.policy import BoltzmannQPolicy
+from rl.policy import BoltzmannQPolicy, EpsGreedyQPolicy
 from rl.memory import SequentialMemory
 from rl.agents import DQNAgent
 from rl.core import Processor
@@ -25,7 +25,7 @@ window_length = 1
 nb_max_start_steps = 1  # random action
 train_interval = 100  # train every 100 steps
 nb_steps_warmup = 50  # before training starts, should be higher than start steps
-nb_steps = 10000
+nb_steps = 100000
 memory_limit = int(nb_steps / 2)
 batch_size = 500  # items sampled from memory to train
 enable_double_dqn = True
@@ -62,10 +62,10 @@ class Player:
         nb_actions = self.env.action_space.n
 
         self.model = Sequential()
-        self.model.add(Dense(128, activation='relu',
+        self.model.add(Dense(512, activation='relu',
                              input_shape=env.observation_space))
         self.model.add(Dropout(0.2))
-        self.model.add(Dense(256, activation='relu'))
+        self.model.add(Dense(512, activation='relu'))
         self.model.add(Dropout(0.2))
         self.model.add(Dense(512, activation='relu'))
         self.model.add(Dropout(0.2))
@@ -75,7 +75,7 @@ class Player:
         # even the metrics!
         memory = SequentialMemory(
             limit=memory_limit, window_length=window_length)
-        policy = TrumpPolicy()
+        policy = EpsGreedyQPolicy()
 
         nb_actions = env.action_space.n
 
@@ -99,12 +99,9 @@ class Player:
         timestr = time.strftime("%Y%m%d-%H%M%S") + "_" + str(env_name)
         tensorboard = TensorBoard(log_dir='./Graph/{}'.format(timestr), histogram_freq=0, write_graph=True,
                                   write_images=False)
-        # tensorboard = TensorBoard(log_dir="logs")
-        tensorboard = TensorBoard(log_dir='./logs', histogram_freq=0, batch_size=32, write_graph=True, write_grads=False,
-                                  write_images=False, embeddings_freq=0, embeddings_layer_names=None, embeddings_metadata=None)
 
         self.dqn.fit(self.env, nb_max_start_steps=nb_max_start_steps, nb_steps=nb_steps, visualize=False, verbose=2,
-                     start_step_policy=self.start_step_policy)
+                     start_step_policy=self.start_step_policy, callbacks=[tensorboard])
 
         # Save the architecture
         dqn_json = self.model.to_json()
@@ -116,7 +113,7 @@ class Player:
             'dqn_{}_weights.h5'.format(env_name), overwrite=True)
 
         # Finally, evaluate our algorithm for 5 episodes.
-        self.dqn.test(self.env, nb_episodes=5, visualize=False)
+        self.dqn.test(self.env, nb_episodes=50, visualize=False)
 
     def load(self, env_name):
         """Load a model"""
